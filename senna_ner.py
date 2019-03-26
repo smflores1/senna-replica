@@ -1,16 +1,18 @@
 import os
 import json
+import nltk
 import time
 import datetime
 import numpy as np
 import tensorflow as tf
 import constants as const
 import utils.utils as utils
+from utils.utils import Word2Vec
+# Only if you use gensim for your word embeddings:
+# from gensim.models import Word2Vec
 from sklearn.metrics import accuracy_score
 
-# TO DO: add word2vec model dimension to the wdvec_details.json file.
-# TO DO: add caps dimension (4) to the wdvec_details.json file.
-# TO DO: replace self.output_shape_list[0] with a num_labels attribute.
+nltk.download('punkt', quiet = True)
 
 class SennaNER(object):
 
@@ -35,21 +37,6 @@ class SennaNER(object):
         # Otherwise, we do not allow the user to (directly) update the attributes:
         else:
             raise NotImplementedError
-
-    # # Class getter:
-    # def __getattr__(self, attr_str):
-
-    #     '''
-        
-    #     Description:
-
-    #     Inputs:
-
-    #     Output:
-
-    #     '''
-
-    #     return object.__getattr__(self, attr_str)
 
     # Class deleter:
     def __delattr__(self, attr_str):
@@ -85,15 +72,9 @@ class SennaNER(object):
         '''
 
         # The user must specify a project name, a data name, and a model name:
-        for key in ['project_name', 'wdvec_name', 'model_name']:
+        for key in ['project_name', 'model_name']:
             assert key in model_details_dict
             assert isinstance(model_details_dict[key], str)
-
-        # Include any of these missing key, value pairs in 'model_details_dict':
-        if 'learning_rate' not in model_details_dict:
-            model_details_dict['learning_rate'] = 0.01
-        if 'num_trained_epochs' not in model_details_dict:
-            model_details_dict['num_trained_epochs'] = 0
 
         # Set the inputs to class attributes:
         for key in model_details_dict:
@@ -102,17 +83,19 @@ class SennaNER(object):
         # Set a timestamp as a class attribute:
         object.__setattr__(self, 'timestamp', datetime.datetime.now().isoformat().replace(':', '-'))
         
-        # Set the wdvec and model details path and its parent directory paths as class attributes:
-        self.set_wdvec_details_path()
+        # Set the corpus path and the word embedding models path:
+        self.set_corpus_path()
+        self.set_wdvecs_path()
+
+        # Set the model details path and its parent directory paths as class attributes:
         self.set_model_details_path()
 
-        # Load the wdvec details if the necessary file exists:
-        if os.path.exists(self.wdvec_details_path):
-            self.load_wdvec_details()
+        # Set the word embeddings and their dimension as a class attribute:
+        object.__setattr__(self, 'wdvec_model', Word2Vec.load(self.wdvecs_path))
+        object.__setattr__(self, 'wdvec_dim',   self.wdvec_model.vector_size)
 
-        # Otherwise, raise an Exception:
-        else:
-            raise Exception
+        # Set the dimension of the capitalization feature (equals 4):
+        self.set_caps_dim()
 
         # Load the model details if the necessary file exists:
         if os.path.exists(self.model_details_path):
@@ -121,7 +104,21 @@ class SennaNER(object):
         # Otherwise, make a new directory to store the model details and dump them there:
         else:
             self.make_model_path()
-            # self.save_model_details() # BRING BACK
+
+        # Include any of these potentially missing class attributes:
+        if not hasattr(self, 'tag_type'):
+            object.__setattr__(self, 'tag_type', 'IOB')
+        if not hasattr(self, 'loss_type'):
+            object.__setattr__(self, 'loss_type', 'word_level')
+        if not hasattr(self, 'padding'):
+            object.__setattr__(self, 'padding', 2)
+        if not hasattr(self, 'learning_rate'):
+            object.__setattr__(self, 'learning_rate', 0.01)
+        if not hasattr(self, 'num_trained_epochs'):
+            object.__setattr__(self, 'num_trained_epochs', 0)
+
+        # Save the model details:
+        self.save_model_details()
 
         # Initialize a new empty graph:
         tf.reset_default_graph()
@@ -131,18 +128,18 @@ class SennaNER(object):
         with self.graph.as_default():
         
             # Inputs placeholder:
-            object.__setattr__(self, 'inputs_shape_list', [(self.embedding_dim + self.caps_dim) \
-                                                            * (2 * self.padding + 1)])
+            object.__setattr__(self, 'inputs_shape', (self.wdvec_dim + self.caps_dim) \
+                                                      * (2 * self.padding + 1))
             inputs = tf.placeholder(name = 'inputs',
-                                    dtype = self.train_inputs_datatype,
-                                    shape = [None] + self.inputs_shape_list)
+                                    dtype = tf.float64,
+                                    shape = [None, self.inputs_shape])
             object.__setattr__(self, 'inputs', inputs)
 
             # Target placeholder:
-            object.__setattr__(self, 'output_shape_list', self.nn_design_list[-1]['output_shape'])
+            object.__setattr__(self, 'output_shape', self.nn_design_list[-1]['output_shape'][0])
             target = tf.placeholder(name = 'target',
-                                    dtype = self.train_target_datatype,
-                                    shape = [None] + self.output_shape_list)
+                                    dtype = tf.float64,
+                                    shape = [None, self.output_shape])
             object.__setattr__(self, 'target', target)
 
             # Sentence breaks placeholder:
@@ -153,8 +150,7 @@ class SennaNER(object):
 
             # Create the neural network:
             with tf.variable_scope('neural_network', reuse = tf.AUTO_REUSE):
-                object.__setattr__(self, 'inputs_shape', tf.shape(inputs, name = 'inputs_shape'))
-                object.__setattr__(self, 'layer_shape_list', [self.inputs_shape])
+                object.__setattr__(self, 'layer_shape_list', [tf.shape(inputs, name = 'inputs_shape')])
                 self._create_network()
             output = tf.identity(self.output, name = 'output')
 
@@ -176,10 +172,61 @@ class SennaNER(object):
             saver = tf.train.Saver()
             object.__setattr__(self, 'saver', saver)
 
-            # REMOVE:
-            object.__setattr__(self, 'var_list', [v for v in tf.global_variables()])
+    # Define the 'model_details_dict' class attribute:
+    @property
+    def model_details_dict(self):
+
+        '''
+        
+        Description:
+
+        Inputs:
+
+        Output:
+
+        '''
+
+        model_details_dict = {}
+
+        key_list = ['padding',
+                    'caps_dim',
+                    'dilation',
+                    'tag_type',
+                    'loss_type',
+                    'model_name',
+                    'translation',
+                    'project_name',
+                    'inputs_shape',
+                    'output_shape',
+                    'wdvec_dim',
+                    'learning_rate',
+                    'nn_design_list',
+                    'num_trained_epochs']
+
+        for key in const.LIST_TRAIN_TESTA_TESTB_KEYS:
+            key_list += ['num_' + key + '_datapoints',
+                         'num_' + key + '_sentences']
+            for tag in const.LIST_KEYWORD_TAGS:
+                key_list += ['num_' + key + '_' + tag + '_tags']
+
+        for key in key_list:
+            if hasattr(self, key):
+                model_details_dict[key] = self.__getattribute__(key)
+
+        return model_details_dict
 
     def __enter__(self):
+
+
+        '''
+        
+        Description:
+
+        Inputs:
+
+        Output:
+
+        '''
 
         # Launch the session:
         sess = tf.Session(graph = self.graph)
@@ -199,6 +246,17 @@ class SennaNER(object):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+
+
+        '''
+        
+        Description:
+
+        Inputs:
+
+        Output:
+
+        '''
 
         # Close the session:
         self.sess.close()
@@ -364,23 +422,23 @@ class SennaNER(object):
 
             # Initializer for the transition weights:
             with tf.variable_scope('variable_init', reuse = tf.AUTO_REUSE):
-                start_init = tf.truncated_normal([self.output_shape_list[0]], dtype = self.train_inputs_datatype)
-                trans_init = tf.truncated_normal([self.output_shape_list[0]] * 2, dtype = self.train_inputs_datatype)
-                final_init = tf.truncated_normal([self.output_shape_list[0]], dtype = self.train_inputs_datatype)
+                start_init = tf.truncated_normal([self.output_shape], dtype = tf.float64)
+                trans_init = tf.truncated_normal([self.output_shape] * 2, dtype = tf.float64)
+                final_init = tf.truncated_normal([self.output_shape], dtype = tf.float64)
 
             # Transition weights for IOBES tags at the sentence beginning:
             start_weights = tf.get_variable(name  = 'start_weights',
-                                            dtype = self.train_inputs_datatype,
+                                            dtype = tf.float64,
                                             initializer = start_init)
 
             # Transition scores for IOBES tags in the sentence middle:
             trans_weights = tf.get_variable(name  = 'trans_weights',
-                                            dtype = self.train_inputs_datatype,
+                                            dtype = tf.float64,
                                             initializer = trans_init)
 
             # Transition scores for IOBES tags in the sentence end:
             final_weights = tf.get_variable(name  = 'final_weights',
-                                            dtype = self.train_inputs_datatype,
+                                            dtype = tf.float64,
                                             initializer = final_init)
 
         cap_1 = tf.shape(self.breaks)[0] - 1
@@ -388,7 +446,7 @@ class SennaNER(object):
         def body_1(i, loss):
         
             begin = [self.breaks[i], 0]
-            size = [self.breaks[i + 1] - self.breaks[i], self.output_shape_list[0]]
+            size = [self.breaks[i + 1] - self.breaks[i], self.output_shape]
             sentence_logits = tf.slice(self.output, begin, size)
 
             # Send one-hot-encoded true labels to categorical true labels:
@@ -399,7 +457,7 @@ class SennaNER(object):
 
             def body_2(j, sentence_delta):
                 sentence_delta = tf.reshape(sentence_delta, [-1, 1])
-                sentence_delta_array = tf.concat([sentence_delta] * self.output_shape_list[0], axis = 1)
+                sentence_delta_array = tf.concat([sentence_delta] * self.output_shape, axis = 1)
                 sentence_delta = tf.reduce_logsumexp(trans_weights + sentence_delta_array, axis = 0)
                 sentence_delta += sentence_logits[j]
                 return j + 1, sentence_delta
@@ -429,10 +487,10 @@ class SennaNER(object):
         def cond_1(i, loss):
             return i < cap_1
 
-        start_loss = tf.zeros(shape = 1, dtype = self.train_inputs_datatype)
+        start_loss = tf.zeros(shape = 1, dtype = tf.float64)
         i, loss = tf.while_loop(cond_1, body_1, [0, start_loss])
         
-        loss = tf.divide(loss, tf.cast(cap_1, dtype = self.train_inputs_datatype))[0]
+        loss = tf.divide(loss, tf.cast(cap_1, dtype = tf.float64))[0]
 
         # Set the loss as a class attribute:
         object.__setattr__(self, 'loss', loss)
@@ -453,26 +511,55 @@ class SennaNER(object):
 
     def _build_feed_dict(self, input_data, sample = False):
 
+        '''
+        
+        Description:
+
+        Inputs:
+
+        Output:
+
+        '''
+
         if not sample:
-            sample = list(input_data.keys())
+            sample = sorted(list(input_data.keys()))
 
         sentence_break = 0
 
-        feed_dict = {self.inputs: [],
-                     self.target: [],
-                     self.breaks: [sentence_break]}
+        if all(['target' in input_data[key] for key in input_data]):
 
-        # sample is a list of sentence keys:
-        for key in sample:
+            feed_dict = {self.inputs: [],
+                         self.target: [],
+                         self.breaks: [sentence_break]}
 
-            sentence_break += len(input_data[key]['inputs'])
+            # 'sample' is a list of sentence keys:
+            for key in sample:
 
-            feed_dict[self.inputs] += [input_data[key]['inputs']]
-            feed_dict[self.target] += [input_data[key]['target']]
-            feed_dict[self.breaks] += [sentence_break]
+                sentence_break += len(input_data[key]['inputs'])
 
-        feed_dict[self.inputs] = np.concatenate(feed_dict[self.inputs])
-        feed_dict[self.target] = np.concatenate(feed_dict[self.target])
+                feed_dict[self.inputs] += [input_data[key]['inputs']]
+                feed_dict[self.target] += [input_data[key]['target']]
+                feed_dict[self.breaks] += [sentence_break]
+
+            feed_dict[self.inputs] = np.concatenate(feed_dict[self.inputs])
+            feed_dict[self.target] = np.concatenate(feed_dict[self.target])
+
+        else:
+
+            assert all(['target' not in input_data[key] for key in input_data])
+
+            feed_dict = {self.inputs: [],
+                         self.breaks: [sentence_break]}
+
+            # 'sample' is a list of sentence keys:
+            for key in sample:
+
+                sentence_break += len(input_data[key]['inputs'])
+
+                feed_dict[self.inputs] += [input_data[key]['inputs']]
+                feed_dict[self.breaks] += [sentence_break]
+
+            feed_dict[self.inputs] = np.concatenate(feed_dict[self.inputs])
 
         return feed_dict
 
@@ -493,7 +580,6 @@ class SennaNER(object):
         return loss
     
     def train_model(self,
-                    # input_data,
                     batch_size = 100,
                     display_step = 1,
                     num_training_epochs = 50):
@@ -508,50 +594,32 @@ class SennaNER(object):
 
         '''
 
-        # TO DO: keep input data as an optional parameter to bypass.
-
         train_start = time.time()
         print_start = time.time()
         epoch_begin = self.num_trained_epochs
 
-        self.load_wdvec()
+        input_data, data_details_dict = utils.get_corpus_embedding(self.padding,
+                                                                   self.corpus_path,
+                                                                   self.wdvec_model,
+                                                                   self.tag_type)
 
-        # # print([x for x in tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)])
-        # # print([n.name for n in self.graph.as_graph_def().node])
-        # # with self.graph.as_default():
-        # #     print([v for v in tf.global_variables()])
-        # with self.graph.as_default():
-        #     with tf.variable_scope('loss_function', reuse = True):
-        #         with tf.variable_scope('transition_weights', reuse = True):
-        #             print(self.sess.run(tf.get_variable(name = 'start_weights', dtype = tf.float64)))
+        # Set the data details to class attributes:
+        for key in data_details_dict:
+            object.__setattr__(self, key, data_details_dict[key])
 
-        # pred_labels = self.predict_labels(self.input_data['train'])
-        # pred_labels = np.zeros(self.num_train_datapoints)
-        # prob_list = []
-        # for tag in const.LIST_KEYWORD_TAGS:
-        #     numerator = self.__getattribute__('num_train_' + tag + '_tags')
-        #     prob_list += [numerator / self.num_train_datapoints]
-        # # pred_labels = np.random.choice(len(prob_list), self.num_train_datapoints, prob_list)
-        # pred_labels = [const.LIST_KEYWORD_TAGS[int(i)] for i in pred_labels]
-
-        # eval_feed_dict = {}
-        # for key in const.LIST_TRAIN_TESTA_TESTB_KEYS:
-        #     eval_feed_dict[key] = self._build_feed_dict(input_data = self.input_data[key])
-
-        # true_labels = self._get_tensor_value(eval_feed_dict['train'], self.target)
-        # true_labels = np.argmax(true_labels, axis = 1)
-        # true_labels = [const.LIST_KEYWORD_TAGS[int(i)] for i in true_labels]
-
-        # print(len(pred_labels))
-        # print(len(true_labels))
-        # raise Exception
+        # input_data = utils.normalize_data(input_data)
+        for key_1 in input_data:
+            for key_2 in input_data[key_1]:
+                input_data[key_1][key_2] = utils.normalize_data(input_data[key_1][key_2],
+                                                                self.translation,
+                                                                self.dilation)
 
         prob_list = []
         for tag in const.LIST_KEYWORD_TAGS:
             numerator = self.__getattribute__('num_train_' + tag + '_tags')
             prob_list += [numerator / self.num_train_datapoints]
         
-        train_data = self.input_data['train']
+        train_data = input_data['train']
         num_samples = len(train_data)
 
         train_metrics_dict = {}
@@ -561,12 +629,14 @@ class SennaNER(object):
                 train_metrics_dict[key_1][key_2] = {}
                 for key_3 in const.LIST_PRED_METHOD_KEYS:
                     train_metrics_dict[key_1][key_2][key_3] = []
-        # object.__setattr__(self, 'train_metrics_dict', train_metrics_dict)
 
         # Create a feed dictionary for the performance metrics:
         eval_feed_dict = {}
         for key in const.LIST_TRAIN_TESTA_TESTB_KEYS:
-            eval_feed_dict[key] = self._build_feed_dict(input_data = self.input_data[key])
+            eval_feed_dict[key] = self._build_feed_dict(input_data = input_data[key])
+
+        # Set the train details path as a class attribute:
+        self.set_train_details_path()
 
         for epoch in range(epoch_begin, num_training_epochs):
 
@@ -575,7 +645,7 @@ class SennaNER(object):
             avg_loss = 0.
             num_batches_per_epoch = int(num_samples / batch_size)
             
-            # Loop over all batches
+            # Loop over all batches:
             for i in range(num_batches_per_epoch):
 
                 # Sample 'batch_size' number of sentences:
@@ -589,7 +659,7 @@ class SennaNER(object):
                 # Fit training using batch data:
                 loss = self.update_network(loss_feed_dict)
 
-                # Compute average loss
+                # Compute the average loss:
                 avg_loss += loss * (batch_size / num_samples)
 
             object.__setattr__(self, 'avg_loss', avg_loss)
@@ -606,9 +676,6 @@ class SennaNER(object):
                     loss = self._get_tensor_value(eval_feed_dict[key_1], self.loss)
                     train_metrics_dict[key_1]['loss']['true'] += [(mini_batch_num, loss)]
 
-                    # # Get the output scores for prediction later:
-                    # output = self._get_tensor_value(eval_feed_dict[key_1], self.output)
-
                     # Get the one-hot-encoded true labels and convert to IOBES lables:
                     true_labels = self._get_tensor_value(eval_feed_dict[key_1], self.target)
                     true_labels = np.argmax(true_labels, axis = 1)
@@ -621,7 +688,7 @@ class SennaNER(object):
 
                         # Get the 'true' predicted labels:
                         if key_3 == 'true':
-                            pred_labels = self.predict_labels(self.input_data[key_1])
+                            pred_labels = self.predict_labels(input_data[key_1])
 
                         # Get the 'dumb' predicted labels:
                         elif key_3 == 'dumb':
@@ -653,8 +720,7 @@ class SennaNER(object):
                             f1_score = (2 * precision * recall) / (precision + recall)
                             train_metrics_dict[key_1]['f1_score'][key_3] += [(mini_batch_num, f1_score)]
 
-                # # Output the performance metrics in a json document:
-                # utils.save_train_metrics_dict(model_subdir, train_metrics_dict)
+                object.__setattr__(self, 'train_metrics_dict', train_metrics_dict)
 
                 print_out = 'Epoch {} of {} completed.'.format(epoch + 1, num_training_epochs)
 
@@ -681,6 +747,47 @@ class SennaNER(object):
 
                 self.save_model()
 
+    def get_named_entity_labels(self, input_text):
+
+        '''
+        
+        Description:
+
+        Inputs:
+
+        Output:
+
+        '''
+
+        sentences_list = nltk.sent_tokenize(input_text)
+        sentences_list = [nltk.word_tokenize(sentence) for sentence in sentences_list]
+
+        break_list = [0]
+        for tok_list in sentences_list:
+            break_list += [break_list[-1] + len(tok_list)]
+
+        input_data = utils.get_text_embedding(self.padding,
+                                              self.wdvec_model,
+                                              sentences_list)
+
+        for key in input_data:
+            input_data[key] = utils.normalize_data(input_data[key],
+                                                   self.translation,
+                                                   self.dilation)
+
+        pred_labels_list = self.predict_labels(input_data)
+        pred_labels_list = [const.LIST_KEYWORD_TAGS[i] for i in pred_labels_list]
+
+        labeled_sentences_list = []
+        for i, tok_list in enumerate(sentences_list):
+            left_break = break_list[i]
+            rght_break = break_list[i + 1]
+            tok_label_tuple_list = zip(tok_list, pred_labels_list[left_break: rght_break])
+            labeled_tok_list = [token + ' (' + label + ')' for token, label in tok_label_tuple_list]
+            labeled_sentences_list += [labeled_tok_list]
+
+        return labeled_sentences_list
+
     def predict_labels(self, input_data):
 
         '''
@@ -695,7 +802,6 @@ class SennaNER(object):
 
         eval_feed_dict = self._build_feed_dict(input_data)
         output, breaks = self._get_tensor_value(eval_feed_dict, (self.output, self.breaks))
-        # print(breaks)
 
         # Get word-level label predictions:
         if self.loss_type == 'word_level':
@@ -705,13 +811,15 @@ class SennaNER(object):
             return pred_labels
 
         # Otherwise, get sentence-level label predictions:
+        if self.loss_type != 'sentence_level':
+            raise Exception('Loss type must be either "word_level" or "sentence_level".')
 
         with self.graph.as_default(): # For some reason, the graph is not visible without this line.
             with tf.variable_scope('loss_function', reuse = True):
                 with tf.variable_scope('transition_weights', reuse = True):
-                    frozen_start_weights = self.sess.run(tf.get_variable(name = 'start_weights', dtype = self.train_inputs_datatype))
-                    frozen_trans_weights = self.sess.run(tf.get_variable(name = 'trans_weights', dtype = self.train_inputs_datatype))
-                    frozen_final_weights = self.sess.run(tf.get_variable(name = 'final_weights', dtype = self.train_inputs_datatype))
+                    frozen_start_weights = self.sess.run(tf.get_variable(name = 'start_weights', dtype = tf.float64))
+                    frozen_trans_weights = self.sess.run(tf.get_variable(name = 'trans_weights', dtype = tf.float64))
+                    frozen_final_weights = self.sess.run(tf.get_variable(name = 'final_weights', dtype = tf.float64))
 
         pred_labels = []
         sentence_outputs = np.split(output, breaks[1:-1])
@@ -747,7 +855,7 @@ class SennaNER(object):
     def set_project_path(self):
 
         '''
-        s
+
         Description:
 
         Inputs:
@@ -759,7 +867,33 @@ class SennaNER(object):
         project_path = os.path.join(const.PATH_ROOT, self.project_name)
         object.__setattr__(self, 'project_path', project_path)
 
+    def set_corpus_path(self):
+
+        '''
+        
+        Description:
+
+        Inputs:
+
+        Output:
+
+        '''
+
+        self.set_project_path()
+        wdvec_path = os.path.join(self.project_path, const.DIR_CORPUS)
+        object.__setattr__(self, 'corpus_path', wdvec_path)
+
     def set_wdvecs_path(self):
+
+        '''
+        
+        Description:
+
+        Inputs:
+
+        Output:
+
+        '''
 
         self.set_project_path()
         wdvec_path = os.path.join(self.project_path, const.DIR_WDVECS)
@@ -781,22 +915,6 @@ class SennaNER(object):
         models_path = os.path.join(self.project_path, const.DIR_MODELS)
         object.__setattr__(self, 'models_path', models_path)
 
-    def set_wdvec_path(self):
-
-        '''
-        
-        Description:
-
-        Inputs:
-
-        Output:
-
-        '''
-
-        self.set_wdvecs_path()
-        wdvec_path = os.path.join(self.wdvecs_path, self.wdvec_name)
-        object.__setattr__(self, 'wdvec_path', wdvec_path)
-
     def set_model_path(self):
 
         '''
@@ -815,12 +933,6 @@ class SennaNER(object):
         saved_model_path = os.path.join(self.model_path, const.DIR_SAVED_MODEL)
         object.__setattr__(self, 'saved_model_path', saved_model_path)
 
-    def set_wdvec_details_path(self):
-
-        self.set_wdvec_path()
-        wdvec_details_path = os.path.join(self.wdvec_path, const.WDVEC_DETAILS)
-        object.__setattr__(self, 'wdvec_details_path', wdvec_details_path)
-
     def set_model_details_path(self):
 
         '''
@@ -834,8 +946,24 @@ class SennaNER(object):
         '''
 
         self.set_model_path()
-        model_details_path = os.path.join(self.model_path, const.MODEL_DETAILS)
+        model_details_path = os.path.join(self.model_path, const.JSON_MODEL_DETAILS)
         object.__setattr__(self, 'model_details_path', model_details_path)
+
+    def set_train_details_path(self):
+
+        '''
+        
+        Description:
+
+        Inputs:
+
+        Output:
+
+        '''
+
+        self.set_model_path()
+        train_details_path = os.path.join(self.model_path, const.JSON_TRAIN_DETAILS)
+        object.__setattr__(self, 'train_details_path', train_details_path)
 
     def make_project_path(self):
 
@@ -852,23 +980,6 @@ class SennaNER(object):
         self.set_project_path()
         if not os.path.exists(self.project_path):
             os.mkdir(self.project_path)
-
-    def make_wdvecs_path(self):
-
-        '''
-        
-        Description:
-
-        Inputs:
-
-        Output:
-
-        '''
-
-        self.set_wdvecs_path()
-        if not os.path.exists(self.wdvecs_path):
-            self.make_project_path()
-            os.mkdir(self.wdvecs_path)
 
     def make_models_path(self):
 
@@ -899,26 +1010,6 @@ class SennaNER(object):
 
         '''
 
-        self.set_wdvec_path()
-        if not os.path.exists(self.wdvec_path):
-            self.make_wdvecs_path()
-            object.__setattr__(self, 'wdvec_name', self.wdvec_name + '_' + self.timestamp)
-            object.__setattr__(self, 'wdvec_path', self.wdvec_path + '_' + self.timestamp)
-            os.mkdir(self.wdvec_path)
-            self.set_wdvec_details_path()
-
-    def make_model_path(self):
-
-        '''
-        
-        Description:
-
-        Inputs:
-
-        Output:
-
-        '''
-
         self.set_model_path()
         if not os.path.exists(self.model_path):
             self.make_models_path()
@@ -930,7 +1021,7 @@ class SennaNER(object):
             # os.mkdir(self.saved_model_path)
             self.set_model_details_path()
 
-    def load_wdvec_details(self):
+    def set_caps_dim(self):
 
         '''
         
@@ -942,15 +1033,9 @@ class SennaNER(object):
 
         '''
 
-        with open(self.wdvec_details_path) as file_handle:
+        object.__setattr__(self, 'caps_dim', const.CAPS_DIM)
 
-            loaded_wdvec_details_dict = json.load(file_handle)
-
-            for key in loaded_wdvec_details_dict:
-                object.__setattr__(self, key, loaded_wdvec_details_dict[key])
-            self.check_wdvec_details_dict_format()
-
-    def check_wdvec_details_dict_format(self):
+    def check_model_details_dict_format(self):
 
         '''
         
@@ -962,30 +1047,82 @@ class SennaNER(object):
 
         '''
 
-        pass
+        # TO DO: check that the value for each key of 'model_details_dict'
+        # is the correct datetype and has the correct format.
 
-    def load_wdvec(self):
+        return True
 
-        # Load the data:
-        data = {}
-        for key_1 in const.LIST_TRAIN_TESTA_TESTB_KEYS: # TO DO: infer keys from data, make in to attr
+    def load_model_details(self):
 
-            file_name = os.path.join(self.wdvec_path, key_1 + '.npy')
-            numpy_data = np.load(file_name)
-            data[key_1] = numpy_data[()]
+        '''
         
-        # Normalize the data so the training data is centered:
-        assert 'train' in const.LIST_TRAIN_TESTA_TESTB_KEYS # TO DO: infer keys from data, make in to attr
-        train_data = np.concatenate([data['train'][key_2]['inputs'] for key_2 in data[key_1]])
-        translation = np.mean(train_data, axis = 0)
-        dilation = np.amax(np.std(train_data - translation, axis = 1))
+        Description:
 
-        for key_1 in const.LIST_TRAIN_TESTA_TESTB_KEYS: # TO DO: infer keys from data, make in to attrs
-            for key_2 in data[key_1]:
-                data[key_1][key_2]['inputs'] -= translation
-                data[key_1][key_2]['inputs'] /= dilation
+        Inputs:
 
-        object.__setattr__(self, 'input_data', data)
+        Output:
+
+        '''
+
+        with open(self.model_details_path) as file_handle:
+
+            loaded_model_details_dict = json.load(file_handle)
+
+            for key in loaded_model_details_dict:
+
+                if key not in self.model_details_dict:
+                    continue
+
+                if key == 'num_trained_epochs':
+                    continue
+
+                if self.model_details_dict[key] != loaded_model_details_dict[key]:
+                    exception = 'The "input model details dict" does not equal ' \
+                    + 'the "loaded model details dict" at the key "{}": '.format(key) \
+                    + '{} != {}. '.format(self.model_details_dict[key],
+                                          loaded_model_details_dict[key]) \
+                    + 'If you mean to load an existing model, then drop this key ' \
+                    + 'from the "input model details dict." If you mean to create a ' \
+                    + 'new model, then use a model name different from ' \
+                    + '"{}" because a model by that name already exists.'.format(self.model_name)
+                    raise Exception(exception)
+
+            for key in loaded_model_details_dict:
+                object.__setattr__(self, key, loaded_model_details_dict[key])
+            self.check_model_details_dict_format()
+
+    def save_model_details(self):
+
+        '''
+        
+        Description:
+
+        Inputs:
+
+        Output:
+
+        '''
+
+        self.check_model_details_dict_format()
+
+        with open(self.model_details_path, 'w+') as file_handle:
+            json.dump(self.model_details_dict, file_handle, default = utils.default)
+
+    def save_train_details(self):
+
+        '''
+        
+        Description:
+
+        Inputs:
+
+        Output:
+
+        '''
+
+        # Output the performance metrics in a json document:
+        with open(self.train_details_path, 'w+') as file_handle:
+            json.dump(self.train_metrics_dict, file_handle, default = utils.default)
 
     def load_model(self):
 
@@ -1020,9 +1157,20 @@ class SennaNER(object):
         assert os.path.exists(self.model_path)
         save_model_path = os.path.join(self.model_path, self.model_path.split('/')[-1])
         self.saver.save(self.sess, save_model_path)
-        # self.save_model_details() # BRING BACK
+        self.save_model_details()
+        self.save_train_details()
 
     def check_tensor_rank(self, tensor, rank):
+
+        '''
+        
+        Description:
+
+        Inputs:
+
+        Output:
+
+        '''
 
         assert len(tensor.get_shape().as_list()) == rank
 
