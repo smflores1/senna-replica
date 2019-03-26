@@ -32,7 +32,7 @@ This repository has the following files and tree structure:
                    |---embeddings.txt
                    |---words_list.txt
                     
-    ```
+```
 (You should replace "project_name" with your own name in this tree and in the appropriate cell in `senna_ner.ipynb`.)
 
 All files in this tree can be used as they are except the following:
