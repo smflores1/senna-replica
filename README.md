@@ -1,5 +1,5 @@
 # senna-replica
-A tensorflow implementation of the senna named entity recognizer (NER).
+A tensorflow implementation of the senna named entity recognizer (NER). See the original article by Collobert et al. at http://ronan.collobert.com/pub/matos/2011_nlp_jmlr.pdf
 
 ## Requirements:
 1. tensorflow v1.13.1
